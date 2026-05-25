@@ -450,16 +450,20 @@ jobs:
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
 
+          # 云端 Action 只生成基础报告并上传 artifact；
+          # Mac mini / n8n 下载后本地补全并负责最终飞书发送。
+          NOTIFY_ARG="--no-notify"
+
           # 执行分析
           if [ "$MODE" = "market-only" ]; then
-            python main.py --market-review $FORCE_RUN_ARG
+            python main.py --market-review $FORCE_RUN_ARG $NOTIFY_ARG
           elif [ "$MODE" = "stocks-only" ]; then
-            python main.py --no-market-review $FORCE_RUN_ARG
+            python main.py --no-market-review $FORCE_RUN_ARG $NOTIFY_ARG
           else
-            python main.py $FORCE_RUN_ARG
+            python main.py $FORCE_RUN_ARG $NOTIFY_ARG
           fi
       
-      - name: 上传分析报告
+      - name: 上传基础分析报告 artifact
         uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -467,6 +471,7 @@ jobs:
           path: |
             reports/
             logs/
+          if-no-files-found: warn
           retention-days: 30
       
       - name: 显示运行结果
