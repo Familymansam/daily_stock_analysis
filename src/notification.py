@@ -90,6 +90,25 @@ def _safe_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
+
+def _compact_source_chain(source_chain: Any) -> str:
+    if not isinstance(source_chain, list):
+        return "未标注"
+    labels: List[str] = []
+    for item in source_chain:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "").strip()
+        result = str(item.get("result") or "").strip()
+        if not provider:
+            continue
+        label = provider if not result or result == "ok" else f"{provider}:{result}"
+        if label not in labels:
+            labels.append(label)
+        if len(labels) >= 4:
+            break
+    return "、".join(labels) if labels else "未标注"
+
 if TYPE_CHECKING:
     from src.analyzer import AnalysisResult
 
@@ -1049,6 +1068,7 @@ class NotificationService(
                     # 业绩预期
                     if intel.get('earnings_outlook'):
                         report_lines.append(f"**📊 {labels['earnings_outlook_label']}**: {intel['earnings_outlook']}")
+                    self._append_earnings_raw_data(report_lines, result)
                     # 风险警报（醒目显示）
                     risk_alerts = intel.get('risk_alerts', [])
                     if risk_alerts:
@@ -1845,6 +1865,39 @@ class NotificationService(
         self._append_financial_summary(lines, blocks, labels)
         self._append_shareholder_return(lines, blocks, labels)
         self._append_related_boards(lines, blocks, labels)
+
+    def _append_earnings_raw_data(self, lines: List[str], result: AnalysisResult) -> None:
+        """Append raw earnings facts near the LLM earnings outlook.
+
+        This keeps the model-written outlook separate from deterministic
+        source-backed facts, so downstream TradingAgents can read both from the
+        GitHub artifact markdown.
+        """
+        blocks = self._get_fundamental_blocks(result)
+        report = blocks.get("financial_report") or {}
+        growth = blocks.get("growth") or {}
+        ctx = getattr(result, "fundamental_context", None)
+        earnings_block = ctx.get("earnings") if isinstance(ctx, dict) and isinstance(ctx.get("earnings"), dict) else {}
+        earnings_data = earnings_block.get("data") if isinstance(earnings_block.get("data"), dict) else {}
+        source = _compact_source_chain(earnings_block.get("source_chain") or (ctx.get("source_chain") if isinstance(ctx, dict) else None))
+
+        lines.append("**📎 业绩原始数据与来源**:")
+        currency = report.get("currency") if isinstance(report.get("currency"), str) else None
+        if report:
+            cells = [
+                f"报告期 {self._format_text(report.get('report_date'))}",
+                f"营收 {self._format_amount_cn(report.get('revenue'), currency)}",
+                f"归母净利润 {self._format_amount_cn(report.get('net_profit_parent'), currency)}",
+                f"经营现金流 {self._format_amount_cn(report.get('operating_cash_flow'), currency)}",
+                f"ROE {self._format_percent(report.get('roe') if report.get('roe') is not None else growth.get('roe'))}",
+            ]
+            lines.append(f"- 财报摘要: {'；'.join(cells)}。来源: {source}")
+        else:
+            lines.append(f"- 财报摘要: 未获取到结构化财报字段。来源: {source}")
+
+        forecast = str(earnings_data.get("forecast_summary") or "").strip()
+        quick = str(earnings_data.get("quick_report_summary") or "").strip()
+        lines.append(f"- 业绩预告/快报: {forecast or quick or '未获取到明确业绩预告/快报'}。来源: {source}")
 
     def _append_financial_summary(
         self,
