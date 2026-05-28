@@ -31,6 +31,15 @@ from src.utils.data_processing import normalize_model_used
 logger = logging.getLogger(__name__)
 
 
+_CURRENCY_SUFFIX = {
+    "USD": "美元",
+    "HKD": "港元",
+    "CNY": "元",
+    "RMB": "元",
+    "CNH": "元",
+}
+
+
 def _escape_md(text: str) -> str:
     """Escape markdown special chars (*ST etc)."""
     if not text:
@@ -56,6 +65,80 @@ def _clean_sniper_value(val: Any) -> str:
         if s.startswith(prefix):
             return s[len(prefix):]
     return s
+
+
+def _format_raw_amount(value: Any, currency: Optional[str] = None) -> str:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if amount != amount:
+        return "N/A"
+    sign = "-" if amount < 0 else ""
+    abs_amount = abs(amount)
+    suffix = _CURRENCY_SUFFIX.get((currency or "").upper(), "元")
+    if abs_amount >= 1e8:
+        return f"{sign}{abs_amount / 1e8:.2f} 亿{suffix}"
+    if abs_amount >= 1e4:
+        return f"{sign}{abs_amount / 1e4:.2f} 万{suffix}"
+    return f"{sign}{abs_amount:.0f} {suffix}"
+
+
+def _format_raw_percent(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}%"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _compact_source_chain(source_chain: Any) -> str:
+    if not isinstance(source_chain, list):
+        return "未标注"
+    labels: List[str] = []
+    for item in source_chain:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "").strip()
+        result = str(item.get("result") or "").strip()
+        if not provider:
+            continue
+        label = provider if not result or result == "ok" else f"{provider}:{result}"
+        if label not in labels:
+            labels.append(label)
+        if len(labels) >= 4:
+            break
+    return "、".join(labels) if labels else "未标注"
+
+
+def earnings_raw_lines(result: AnalysisResult) -> List[str]:
+    ctx = getattr(result, "fundamental_context", None)
+    if not isinstance(ctx, dict):
+        return ["- 财报摘要: 未获取到结构化财报字段。来源: 未标注"]
+
+    earnings_block = ctx.get("earnings") if isinstance(ctx.get("earnings"), dict) else {}
+    earnings_data = earnings_block.get("data") if isinstance(earnings_block.get("data"), dict) else {}
+    financial_report = earnings_data.get("financial_report") if isinstance(earnings_data.get("financial_report"), dict) else {}
+    growth = ctx.get("growth", {}).get("data", {}) if isinstance(ctx.get("growth"), dict) and isinstance(ctx.get("growth", {}).get("data"), dict) else {}
+    source = _compact_source_chain(earnings_block.get("source_chain") or ctx.get("source_chain"))
+
+    lines: List[str] = []
+    if financial_report:
+        currency = financial_report.get("currency") if isinstance(financial_report.get("currency"), str) else None
+        cells = [
+            f"报告期 {financial_report.get('report_date') or 'N/A'}",
+            f"营收 {_format_raw_amount(financial_report.get('revenue'), currency)}",
+            f"归母净利润 {_format_raw_amount(financial_report.get('net_profit_parent'), currency)}",
+            f"经营现金流 {_format_raw_amount(financial_report.get('operating_cash_flow'), currency)}",
+            f"ROE {_format_raw_percent(financial_report.get('roe') if financial_report.get('roe') is not None else growth.get('roe'))}",
+        ]
+        lines.append(f"- 财报摘要: {'；'.join(cells)}。来源: {source}")
+    else:
+        lines.append(f"- 财报摘要: 未获取到结构化财报字段。来源: {source}")
+
+    forecast = str(earnings_data.get("forecast_summary") or "").strip()
+    quick = str(earnings_data.get("quick_report_summary") or "").strip()
+    lines.append(f"- 业绩预告/快报: {forecast or quick or '未获取到明确业绩预告/快报'}。来源: {source}")
+    return lines
 
 
 def _resolve_templates_dir() -> Path:
@@ -129,6 +212,7 @@ def render(
             "stock_name": _escape_md(rn),
             "localized_operation_advice": localize_operation_advice(r.operation_advice, report_language),
             "localized_trend_prediction": localize_trend_prediction(r.trend_prediction, report_language),
+            "earnings_raw_lines": earnings_raw_lines(r),
         })
 
     buy_count = sum(1 for r in results if getattr(r, "decision_type", "") == "buy")
@@ -170,6 +254,7 @@ def render(
         "localize_operation_advice": localize_operation_advice,
         "localize_trend_prediction": localize_trend_prediction,
         "localize_chip_health": localize_chip_health,
+        "earnings_raw_lines": earnings_raw_lines,
     }
     if extra_context:
         safe_extra_context = dict(extra_context)
