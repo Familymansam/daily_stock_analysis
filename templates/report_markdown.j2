@@ -30,6 +30,12 @@
 {% if intel.get('earnings_outlook') %}
 **📊 {{ labels.earnings_outlook_label }}**: {{ intel.earnings_outlook }}
 {% endif %}
+{% if e.earnings_raw_lines %}
+**📎 业绩原始数据与来源**:
+{% for line in e.earnings_raw_lines %}
+{{ line }}
+{% endfor %}
+{% endif %}
 {% if intel.get('risk_alerts') %}
 
 **🚨 {{ labels.risk_alerts_label }}**:
