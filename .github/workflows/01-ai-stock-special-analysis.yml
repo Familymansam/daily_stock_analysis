@@ -1,0 +1,33 @@
+name: AI个股专项分析
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '运行模式'
+        required: true
+        default: 'stocks-only'
+        type: choice
+        options:
+          - stocks-only
+          - full
+          - market-only
+      force_run:
+        description: '强制运行（跳过交易日检查）'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  ai-stock-special-analysis:
+    uses: ./.github/workflows/00-daily-analysis.yml
+    with:
+      mode: ${{ inputs.mode }}
+      force_run: ${{ inputs.force_run }}
+      workflow_title: AI个股专项分析
+      concurrency_group: ai-stock-special-analysis
+      artifact_name: ai-stock-special-analysis-reports-${{ github.run_number }}
+      stock_list: 300308,300502,601869,DELL,CRWV,HPE,ARM,VSH,TE,SIVEF,NOK
+      market_review_enabled: 'false'
+      market_review_region: us,cn
+    secrets: inherit

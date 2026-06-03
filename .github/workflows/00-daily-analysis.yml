@@ -22,10 +22,52 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      mode:
+        description: '运行模式'
+        required: false
+        default: 'full'
+        type: string
+      force_run:
+        description: '强制运行（跳过交易日检查）'
+        required: false
+        default: false
+        type: boolean
+      stock_list:
+        description: '覆盖默认自选股列表'
+        required: false
+        default: ''
+        type: string
+      market_review_region:
+        description: '覆盖默认大盘复盘区域'
+        required: false
+        default: ''
+        type: string
+      market_review_enabled:
+        description: '覆盖默认大盘复盘开关'
+        required: false
+        default: ''
+        type: string
+      artifact_name:
+        description: '覆盖 GitHub Artifact 名称'
+        required: false
+        default: ''
+        type: string
+      workflow_title:
+        description: '运行日志中显示的工具名称'
+        required: false
+        default: 'A股自选股智能分析系统'
+        type: string
+      concurrency_group:
+        description: '覆盖并发分组，便于多套工具互不阻塞'
+        required: false
+        default: 'stock-analysis'
+        type: string
 
 # 并发控制：同一时间只运行一个分析任务
 concurrency:
-  group: stock-analysis
+  group: ${{ inputs.concurrency_group || 'stock-analysis' }}
   cancel-in-progress: false
 
 jobs:
@@ -342,8 +384,8 @@ jobs:
           # ==========================================
           # 自选股配置
           # ==========================================
-          STOCK_LIST: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
-          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'cn' }}
+          STOCK_LIST: ${{ inputs.stock_list || vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
+          MARKET_REVIEW_REGION: ${{ inputs.market_review_region || vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'cn' }}
           MARKET_REVIEW_COLOR_SCHEME: ${{ vars.MARKET_REVIEW_COLOR_SCHEME || secrets.MARKET_REVIEW_COLOR_SCHEME || 'green_up' }}
           
           # ==========================================
@@ -353,7 +395,7 @@ jobs:
           REPORT_LANGUAGE: ${{ vars.REPORT_LANGUAGE || secrets.REPORT_LANGUAGE || '' }}
           REPORT_SHOW_LLM_MODEL: ${{ vars.REPORT_SHOW_LLM_MODEL || secrets.REPORT_SHOW_LLM_MODEL || 'true' }}
           SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'false' }}
-          MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
+          MARKET_REVIEW_ENABLED: ${{ inputs.market_review_enabled || vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
           ANALYSIS_DELAY: ${{ vars.ANALYSIS_DELAY || secrets.ANALYSIS_DELAY || '0' }}
           TRADING_DAY_CHECK_ENABLED: ${{ vars.TRADING_DAY_CHECK_ENABLED || secrets.TRADING_DAY_CHECK_ENABLED || 'true' }}
           
@@ -381,10 +423,11 @@ jobs:
           fi
 
           # 判断运行模式
-          MODE="${{ github.event.inputs.mode || 'full' }}"
+          MODE="${{ inputs.mode || 'full' }}"
+          WORKFLOW_TITLE="${{ inputs.workflow_title || 'A股自选股智能分析系统' }}"
           
           echo "=========================================="
-          echo "🚀 A股自选股智能分析系统"
+          echo "🚀 $WORKFLOW_TITLE"
           echo "=========================================="
           echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           echo "🎯 运行模式: $MODE"
@@ -445,7 +488,7 @@ jobs:
           
           # 构建命令行参数
           FORCE_RUN_ARG=""
-          if [ "${{ github.event.inputs.force_run }}" = "true" ]; then
+          if [ "${{ inputs.force_run }}" = "true" ]; then
             FORCE_RUN_ARG="--force-run"
             echo "⚡ 已启用强制运行模式（跳过交易日检查）"
           fi
@@ -467,7 +510,7 @@ jobs:
         uses: actions/upload-artifact@v6
         if: always()
         with:
-          name: analysis-reports-${{ github.run_number }}
+          name: ${{ inputs.artifact_name || format('analysis-reports-{0}', github.run_number) }}
           path: |
             reports/
             logs/
