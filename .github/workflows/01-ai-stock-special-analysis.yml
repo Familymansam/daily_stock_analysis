@@ -27,7 +27,7 @@ jobs:
       workflow_title: AI个股专项分析
       concurrency_group: ai-stock-special-analysis
       artifact_name: ai-stock-special-analysis-reports-${{ github.run_number }}
-      stock_list: 300308,300502,601869,DELL,CRWV,HPE,ARM,VSH,TE,SIVEF,NOK
+      stock_list: 300308,300502,601869,300394,DELL,CRWV,HPE,ARM,VSH,TE,SIVEF,NOK,MRVL,GLW,AVGO,NVDA,TSM,CIEN
       market_review_enabled: 'false'
       market_review_region: us,cn
     secrets: inherit
