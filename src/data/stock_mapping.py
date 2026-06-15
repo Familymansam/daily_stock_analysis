@@ -89,6 +89,9 @@ STOCK_NAME_MAP = {
     "LI": "理想汽车",
     "COIN": "Coinbase",
     "MSTR": "MicroStrategy",
+    "SPCX": "SpaceX",
+    "LITE": "Lumentum",
+    "AVGO": "博通",
     # === HK stocks (5-digit) ===
     "00700": "腾讯控股",
     "03690": "美团",
