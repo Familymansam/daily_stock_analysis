@@ -31,9 +31,17 @@ from src.notification_noise import (
     parse_notification_quiet_hours,
     validate_notification_timezone,
 )
+from src.notification_contracts import (
+    is_feishu_app_bot_configured,
+    is_feishu_static_configured,
+)
 from src.llm import generation_params as llm_generation_params
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_ALPHASIFT_INSTALL_SPEC = (
+    "git+https://github.com/ZhuLinsen/alphasift.git@14e74fc0819267f7c04c3117a0dd0fe3f9b19404"
+)
 
 
 @dataclass
@@ -96,6 +104,41 @@ NEWS_STRATEGY_WINDOWS: Dict[str, int] = {
     "short": 3,
     "medium": 7,
     "long": 30,
+}
+
+
+@dataclass(frozen=True)
+class AgentContextCompressionPreset:
+    """Preset values for visible chat history compression."""
+
+    trigger_tokens: int
+    protected_turns: int
+    summary_target_tokens: int
+    # P1 reserves this budget for future prompt-size controls; it is not
+    # enforced by the current rolling-summary state table.
+    history_budget_tokens: int
+
+
+AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE = "balanced"
+AGENT_CONTEXT_COMPRESSION_PROFILES: Dict[str, AgentContextCompressionPreset] = {
+    "cost": AgentContextCompressionPreset(
+        trigger_tokens=6000,
+        protected_turns=2,
+        summary_target_tokens=900,
+        history_budget_tokens=4000,
+    ),
+    "balanced": AgentContextCompressionPreset(
+        trigger_tokens=12000,
+        protected_turns=4,
+        summary_target_tokens=1500,
+        history_budget_tokens=8000,
+    ),
+    "long_context_raw_first": AgentContextCompressionPreset(
+        trigger_tokens=24000,
+        protected_turns=6,
+        summary_target_tokens=2600,
+        history_budget_tokens=14000,
+    ),
 }
 
 
@@ -210,6 +253,60 @@ def resolve_news_window_days(news_max_age_days: int, news_strategy_profile: Opti
     profile = normalize_news_strategy_profile(news_strategy_profile)
     profile_days = NEWS_STRATEGY_WINDOWS.get(profile, NEWS_STRATEGY_WINDOWS["short"])
     return max(1, min(max(1, int(news_max_age_days)), profile_days))
+
+
+def normalize_agent_context_compression_profile(value: Optional[str]) -> str:
+    """Normalize visible-chat context compression profile values."""
+    candidate = (value or AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE).strip().lower()
+    if candidate in AGENT_CONTEXT_COMPRESSION_PROFILES:
+        return candidate
+    logger.warning(
+        "Invalid AGENT_CONTEXT_COMPRESSION_PROFILE=%r; falling back to %s",
+        value,
+        AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE,
+    )
+    return AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE
+
+
+def get_agent_context_compression_preset(profile: Optional[str]) -> AgentContextCompressionPreset:
+    """Return the preset for a normalized profile, falling back to balanced."""
+    normalized = normalize_agent_context_compression_profile(profile)
+    return AGENT_CONTEXT_COMPRESSION_PROFILES[normalized]
+
+
+def parse_agent_context_compression_int(
+    value: Optional[str],
+    default: int,
+    *,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    """Parse compression integers; empty/invalid/out-of-range values follow preset defaults."""
+    raw_value = value
+    if raw_value is None or not str(raw_value).strip():
+        return int(default)
+    try:
+        parsed = int(str(raw_value).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "%s=%r is not a valid integer; falling back to preset default %s",
+            field_name,
+            raw_value,
+            default,
+        )
+        return int(default)
+    if parsed < minimum or parsed > maximum:
+        logger.warning(
+            "%s=%r is outside supported range [%s, %s]; falling back to preset default %s",
+            field_name,
+            parsed,
+            minimum,
+            maximum,
+            default,
+        )
+        return int(default)
+    return parsed
 
 
 def canonicalize_llm_channel_protocol(value: Optional[str]) -> str:
@@ -536,6 +633,12 @@ class Config:
     longbridge_app_key: Optional[str] = None
     longbridge_app_secret: Optional[str] = None
     longbridge_access_token: Optional[str] = None
+    longbridge_oauth_client_id: Optional[str] = None
+    stock_index_remote_update_enabled: bool = True
+
+    # === AlphaSift optional stock screening integration ===
+    alphasift_enabled: bool = False
+    alphasift_install_spec: str = DEFAULT_ALPHASIFT_INSTALL_SPEC
 
     # === AI 分析配置 ===
     # LiteLLM unified model config (provider/model format, e.g. gemini/gemini-3.1-pro-preview)
@@ -552,6 +655,9 @@ class Config:
     llm_models_source: str = "legacy_env"
     # LLM_CHANNELS: list of channel dicts, each with name/base_url/api_keys/models
     llm_channels: List[Dict[str, Any]] = field(default_factory=list)
+    # Raw channel names requested through LLM_CHANNELS, including channels that
+    # were skipped during parsing because required channel fields were missing.
+    llm_channel_names: List[str] = field(default_factory=list)
     # Pre-built LiteLLM Router model_list (populated from channels, YAML, or legacy keys)
     llm_model_list: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -628,6 +734,10 @@ class Config:
     agent_memory_enabled: bool = False  # Enable memory & calibration system
     agent_skill_autoweight: bool = True  # Auto-weight skills by backtest performance
     agent_skill_routing: str = "auto"  # Skill routing: 'auto' (regime-based) or 'manual'
+    agent_context_compression_enabled: bool = False  # Compress visible chat history before Agent calls
+    agent_context_compression_profile: str = AGENT_CONTEXT_COMPRESSION_DEFAULT_PROFILE
+    agent_context_compression_trigger_tokens: int = 12000
+    agent_context_protected_turns: int = 4
     agent_event_monitor_enabled: bool = False  # Enable periodic event-driven alert checks in schedule mode
     agent_event_monitor_interval_minutes: int = 5  # Polling interval for event monitor background checks
     agent_event_alert_rules_json: str = ""  # JSON array of serialized EventMonitor rules
@@ -641,6 +751,11 @@ class Config:
     feishu_webhook_url: Optional[str] = None
     feishu_webhook_secret: Optional[str] = None  # 自定义机器人签名密钥（可选）
     feishu_webhook_keyword: Optional[str] = None  # 自定义机器人关键词（可选）
+
+    # 飞书应用机器人（App Bot）通知
+    feishu_chat_id: Optional[str] = None  # 目标群会话 chat_id（群聊模式），或用户 open_id（P2P 模式）
+    feishu_receive_id_type: str = "chat_id"  # 接收者 ID 类型: "chat_id"(群聊) / "open_id"(私聊)
+    feishu_domain: str = "feishu"  # 飞书域名: "feishu"(feishu.cn) / "lark"(larksuite.com)
     
     # Telegram 配置（需要同时配置 Bot Token 和 Chat ID）
     telegram_bot_token: Optional[str] = None  # Bot Token（@BotFather 获取）
@@ -782,6 +897,7 @@ class Config:
     schedule_run_immediately: bool = True     # 启动时是否立即执行一次
     run_immediately: bool = True              # 启动时是否立即执行一次（非定时模式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
+    daily_market_context_enabled: bool = True   # 是否将大盘环境摘要用于个股分析 Prompt 与保守护栏
     # 大盘复盘市场区域：cn(A股)、hk(港股)、us(美股)、both(三市场)，us 适合仅关注美股的用户
     market_review_region: str = "cn"
     market_review_color_scheme: str = "green_up"
@@ -926,6 +1042,11 @@ class Config:
                 self.agent_skill_routing, self._VALID_SKILL_ROUTING,
             )
             object.__setattr__(self, "agent_skill_routing", "auto")
+        normalized_profile = normalize_agent_context_compression_profile(
+            self.agent_context_compression_profile
+        )
+        if normalized_profile != self.agent_context_compression_profile:
+            object.__setattr__(self, "agent_context_compression_profile", normalized_profile)
 
     # 单例实例存储
     _instance: Optional['Config'] = None
@@ -1013,10 +1134,6 @@ class Config:
             for c in stock_list_str.split(',')
             if (c or "").strip()
         ]
-        
-        # 如果没有配置，使用默认的示例股票
-        if not stock_list:
-            stock_list = ['600519', '000001', '300750']
         
         # === LiteLLM multi-key parsing ===
         # GEMINI_API_KEYS (comma-separated) > GEMINI_API_KEY (single)
@@ -1127,6 +1244,7 @@ class Config:
         litellm_config_path = os.getenv('LITELLM_CONFIG', '').strip() or None
         llm_models_source = "legacy_env"
         llm_channels: List[Dict[str, Any]] = []
+        llm_channel_names: List[str] = []
         llm_model_list: List[Dict[str, Any]] = []
 
         # Priority 1: LITELLM_CONFIG (standard LiteLLM YAML config file)
@@ -1139,6 +1257,11 @@ class Config:
         if not llm_model_list:
             _channels_str = os.getenv('LLM_CHANNELS', '').strip()
             if _channels_str:
+                llm_channel_names = [
+                    ch.strip().lower()
+                    for ch in _channels_str.split(',')
+                    if ch.strip()
+                ]
                 llm_channels = cls._parse_llm_channels(_channels_str)
                 llm_model_list = cls._channels_to_model_list(llm_channels)
                 if llm_model_list:
@@ -1186,6 +1309,26 @@ class Config:
         agent_litellm_model = normalize_agent_litellm_model(
             os.getenv('AGENT_LITELLM_MODEL', ''),
             configured_models=set(get_configured_llm_models(llm_model_list)),
+        )
+        agent_context_compression_profile = normalize_agent_context_compression_profile(
+            os.getenv('AGENT_CONTEXT_COMPRESSION_PROFILE')
+        )
+        agent_context_compression_preset = get_agent_context_compression_preset(
+            agent_context_compression_profile
+        )
+        agent_context_compression_trigger_tokens = parse_agent_context_compression_int(
+            os.getenv('AGENT_CONTEXT_COMPRESSION_TRIGGER_TOKENS'),
+            agent_context_compression_preset.trigger_tokens,
+            field_name='AGENT_CONTEXT_COMPRESSION_TRIGGER_TOKENS',
+            minimum=1000,
+            maximum=200000,
+        )
+        agent_context_protected_turns = parse_agent_context_compression_int(
+            os.getenv('AGENT_CONTEXT_PROTECTED_TURNS'),
+            agent_context_compression_preset.protected_turns,
+            field_name='AGENT_CONTEXT_PROTECTED_TURNS',
+            minimum=1,
+            maximum=20,
         )
 
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
@@ -1296,12 +1439,18 @@ class Config:
             longbridge_app_key=os.getenv('LONGBRIDGE_APP_KEY') or None,
             longbridge_app_secret=os.getenv('LONGBRIDGE_APP_SECRET') or None,
             longbridge_access_token=os.getenv('LONGBRIDGE_ACCESS_TOKEN') or None,
+            longbridge_oauth_client_id=os.getenv('LONGBRIDGE_OAUTH_CLIENT_ID') or None,
+            stock_index_remote_update_enabled=parse_env_bool(
+                os.getenv('STOCK_INDEX_REMOTE_UPDATE_ENABLED'),
+                default=True,
+            ),
             litellm_model=litellm_model,
             litellm_fallback_models=litellm_fallback_models,
             llm_temperature=resolve_unified_llm_temperature(litellm_model),
             litellm_config_path=litellm_config_path,
             llm_models_source=llm_models_source,
             llm_channels=llm_channels,
+            llm_channel_names=llm_channel_names,
             llm_model_list=llm_model_list,
             gemini_api_keys=gemini_api_keys,
             anthropic_api_keys=anthropic_api_keys,
@@ -1393,6 +1542,13 @@ class Config:
                 os.getenv('AGENT_SKILL_ROUTING')
                 or os.getenv('AGENT_STRATEGY_ROUTING', 'auto')
             ).lower(),
+            agent_context_compression_enabled=parse_env_bool(
+                os.getenv('AGENT_CONTEXT_COMPRESSION_ENABLED'),
+                default=False,
+            ),
+            agent_context_compression_profile=agent_context_compression_profile,
+            agent_context_compression_trigger_tokens=agent_context_compression_trigger_tokens,
+            agent_context_protected_turns=agent_context_protected_turns,
             agent_event_monitor_enabled=os.getenv('AGENT_EVENT_MONITOR_ENABLED', 'false').lower() == 'true',
             agent_event_monitor_interval_minutes=parse_env_int(
                 os.getenv('AGENT_EVENT_MONITOR_INTERVAL_MINUTES'),
@@ -1405,6 +1561,10 @@ class Config:
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
             feishu_webhook_secret=os.getenv('FEISHU_WEBHOOK_SECRET'),
             feishu_webhook_keyword=os.getenv('FEISHU_WEBHOOK_KEYWORD'),
+
+            feishu_chat_id=os.getenv('FEISHU_CHAT_ID'),
+            feishu_receive_id_type=os.getenv('FEISHU_RECEIVE_ID_TYPE', 'chat_id'),
+            feishu_domain=os.getenv('FEISHU_DOMAIN', 'feishu'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
             telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
             telegram_message_thread_id=os.getenv('TELEGRAM_MESSAGE_THREAD_ID'),
@@ -1542,6 +1702,7 @@ class Config:
             schedule_run_immediately=schedule_run_immediately,
             run_immediately=legacy_run_immediately,
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
+            daily_market_context_enabled=os.getenv('DAILY_MARKET_CONTEXT_ENABLED', 'true').lower() == 'true',
             market_review_region=cls._parse_market_review_region(
                 os.getenv('MARKET_REVIEW_REGION', 'cn')
             ),
@@ -1647,7 +1808,13 @@ class Config:
                 field_name='PORTFOLIO_RISK_LOOKBACK_DAYS',
                 minimum=1,
             ),
-            portfolio_fx_update_enabled=os.getenv('PORTFOLIO_FX_UPDATE_ENABLED', 'true').lower() == 'true'
+            portfolio_fx_update_enabled=os.getenv('PORTFOLIO_FX_UPDATE_ENABLED', 'true').lower() == 'true',
+            alphasift_enabled=parse_env_bool(os.getenv('ALPHASIFT_ENABLED'), default=False),
+            alphasift_install_spec=(
+                DEFAULT_ALPHASIFT_INSTALL_SPEC
+                if os.getenv('ALPHASIFT_INSTALL_SPEC') is None
+                else os.getenv('ALPHASIFT_INSTALL_SPEC', '').strip()
+            ),
         )
     
     @classmethod
@@ -1801,7 +1968,12 @@ class Config:
 
     @classmethod
     def _channels_to_model_list(cls, channels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Convert parsed LLM channels to LiteLLM Router model_list format."""
+        """Convert parsed LLM channels to LiteLLM Router model_list format.
+
+        Mapping follows:
+        - LiteLLM providers: https://docs.litellm.ai/docs/providers
+        - LiteLLM model_list 语义: https://docs.litellm.ai/docs/proxy/configs#the-model_list-key
+        """
         model_list: List[Dict[str, Any]] = []
         for ch in channels:
             for model_name in ch['models']:
@@ -1841,6 +2013,11 @@ class Config:
         deployments, keyed by placeholder model_name tokens.  The analyzer
         resolves actual model_names at call time from LITELLM_MODEL /
         LITELLM_FALLBACK_MODELS.
+
+        Compatibility note:
+        - LiteLLM OpenAI-compatible 约定: https://docs.litellm.ai/docs/providers/openai_compatible
+        - OpenAI 请求与鉴权约定: https://platform.openai.com/docs/api-reference/making-requests
+          / https://platform.openai.com/docs/api-reference/authentication
         """
         model_list: List[Dict[str, Any]] = []
 
@@ -2230,9 +2407,6 @@ class Config:
             if (c or "").strip()
         ]
 
-        if not stock_list:
-            stock_list = ['000001']
-
         self.stock_list = stock_list
     
     def validate_structured(self) -> List[ConfigIssue]:
@@ -2254,7 +2428,7 @@ class Config:
         if not self.stock_list:
             issues.append(ConfigIssue(
                 severity="error",
-                message="未配置自选股列表 (STOCK_LIST)",
+                message="未配置 STOCK_LIST。请设置至少一个股票代码，例如：600519,hk00700,AAPL。",
                 field="STOCK_LIST",
             ))
         elif self.stock_email_groups:
@@ -2303,14 +2477,36 @@ class Config:
         # direct litellm env path and therefore do not populate llm_model_list.
         has_direct_env_model = bool(self.litellm_model) and _uses_direct_env_provider(self.litellm_model)
         if not self.llm_model_list and not has_direct_env_model:
-            issues.append(ConfigIssue(
-                severity="error",
-                message=(
-                    "未配置任何可用的 AI 模型接入（高级模型路由配置 / 渠道 / API Key），"
-                    "AI 分析功能将不可用"
-                ),
-                field="LITELLM_CONFIG",
-            ))
+            if self.litellm_config_path:
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=(
+                        "已配置 LITELLM_CONFIG，但未解析出可用模型。"
+                        "请检查 YAML 中的 model_list、litellm_params 和环境变量引用。"
+                    ),
+                    field="LITELLM_CONFIG",
+                ))
+            elif self.llm_channel_names:
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=(
+                        "已配置 LLM_CHANNELS，但未解析出可用模型渠道。"
+                        "请检查对应 LLM_<CHANNEL>_API_KEY(S)、"
+                        "LLM_<CHANNEL>_MODELS、LLM_<CHANNEL>_PROTOCOL 或 Base URL。"
+                    ),
+                    field="LLM_CHANNELS",
+                ))
+            else:
+                issues.append(ConfigIssue(
+                    severity="error",
+                    message=(
+                        "未配置任何可用的 AI 模型接入。请至少配置 ANSPIRE_API_KEYS、"
+                        "AIHUBMIX_KEY、GEMINI_API_KEY、ANTHROPIC_API_KEY、"
+                        "OPENAI_API_KEY 或 DEEPSEEK_API_KEY 中的一个，或配置 "
+                        "LITELLM_CONFIG / LLM_CHANNELS 可用模型渠道。"
+                    ),
+                    field="LITELLM_CONFIG",
+                ))
         elif not self.litellm_model:
             issues.append(ConfigIssue(
                 severity="info",
@@ -2425,6 +2621,11 @@ class Config:
         has_notification = bool(
             self.wechat_webhook_url
             or self.feishu_webhook_url
+            or (
+                (self.feishu_app_id or "")
+                and (self.feishu_app_secret or "")
+                and (self.feishu_chat_id or "")
+            )
             or (self.telegram_bot_token and self.telegram_chat_id)
             or (self.email_sender and self.email_password)
             or (self.pushover_user_key and self.pushover_api_token)
@@ -2450,6 +2651,49 @@ class Config:
                 message="未配置通知渠道，将不发送推送通知",
                 field="WECHAT_WEBHOOK_URL",
             ))
+
+        has_telegram_token = bool((self.telegram_bot_token or "").strip())
+        has_telegram_chat_id = bool((self.telegram_chat_id or "").strip())
+        if has_telegram_token != has_telegram_chat_id:
+            issues.append(ConfigIssue(
+                severity="error",
+                message="Telegram 通知配置不完整：TELEGRAM_BOT_TOKEN 和 TELEGRAM_CHAT_ID 必须同时配置。",
+                field="TELEGRAM_CHAT_ID" if has_telegram_token else "TELEGRAM_BOT_TOKEN",
+            ))
+
+        has_email_sender = bool((self.email_sender or "").strip())
+        has_email_password = bool((self.email_password or "").strip())
+        if has_email_sender != has_email_password:
+            issues.append(ConfigIssue(
+                severity="error",
+                message="邮件通知配置不完整：EMAIL_SENDER 和 EMAIL_PASSWORD 必须同时配置。",
+                field="EMAIL_PASSWORD" if has_email_sender else "EMAIL_SENDER",
+            ))
+
+        def _warn_if_webhook_url_invalid(field: str, value: Optional[str]) -> None:
+            raw_url = (value or "").strip()
+            if not raw_url:
+                return
+            parsed = urlparse(raw_url)
+            if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+                return
+            issues.append(ConfigIssue(
+                severity="warning",
+                message=f"{field} 看起来不是有效 URL，请确认是否以 http:// 或 https:// 开头。",
+                field=field,
+            ))
+
+        for field, value in (
+            ("WECHAT_WEBHOOK_URL", self.wechat_webhook_url),
+            ("FEISHU_WEBHOOK_URL", self.feishu_webhook_url),
+            ("DISCORD_WEBHOOK_URL", self.discord_webhook_url),
+            ("SLACK_WEBHOOK_URL", self.slack_webhook_url),
+            ("ASTRBOT_URL", self.astrbot_url),
+        ):
+            _warn_if_webhook_url_invalid(field, value)
+
+        for custom_url in self.custom_webhook_urls:
+            _warn_if_webhook_url_invalid("CUSTOM_WEBHOOK_URLS", custom_url)
 
         if self.ntfy_url and not _has_ntfy_topic_endpoint(self.ntfy_url):
             issues.append(ConfigIssue(
@@ -2518,27 +2762,35 @@ class Config:
 
         has_feishu_app_id = bool((self.feishu_app_id or "").strip())
         has_feishu_app_secret = bool((self.feishu_app_secret or "").strip())
+        has_feishu_app_credentials_complete = has_feishu_app_id and has_feishu_app_secret
         has_feishu_app_credentials = has_feishu_app_id or has_feishu_app_secret
         has_feishu_doc_token = bool((self.feishu_folder_token or "").strip())
         has_feishu_full_cloud_doc_credentials = (
-            has_feishu_app_id
-            and has_feishu_app_secret
+            has_feishu_app_credentials_complete
             and has_feishu_doc_token
         )
+        has_feishu_stream_route = bool(self.feishu_stream_enabled and has_feishu_app_credentials_complete)
+        has_feishu_app_notification_route = is_feishu_app_bot_configured(self)
         if (
             has_feishu_app_credentials
             and not has_feishu_full_cloud_doc_credentials
-            and not self.feishu_webhook_url
-            and not (self.feishu_stream_enabled and has_feishu_app_id and has_feishu_app_secret)
+            and not is_feishu_static_configured(self)
+            and not has_feishu_stream_route
+            and not has_feishu_app_notification_route
         ):
+            suggestions = []
+            if has_feishu_app_credentials_complete:
+                suggestions.append("配置 FEISHU_CHAT_ID 开启 App Bot 主动推送")
+                suggestions.append("开启 FEISHU_STREAM_ENABLED 使用应用机器人事件订阅")
+            else:
+                suggestions.append("补齐 FEISHU_APP_ID / FEISHU_APP_SECRET 后配置 FEISHU_CHAT_ID 开启 App Bot 主动推送")
+            suggestions.append("配置 FEISHU_WEBHOOK_URL 使用自定义机器人 Webhook 推送")
             issues.append(ConfigIssue(
                 severity="warning",
-                message=(
-                    "仅配置 FEISHU_APP_ID / FEISHU_APP_SECRET 不会开启飞书群 Webhook 推送；"
-                    "如需群消息通知，请配置 FEISHU_WEBHOOK_URL。若要使用应用机器人，请同时开启 "
-                    "FEISHU_STREAM_ENABLED 并完成应用发布与权限配置。"
-                ),
-                field="FEISHU_WEBHOOK_URL",
+                message="仅配置 FEISHU_APP_ID / FEISHU_APP_SECRET 不会开启飞书静态通知。"
+                        + " 请选择以下方式之一："
+                        + "；".join(suggestions) + "。",
+                field="FEISHU_CHAT_ID",
             ))
 
         # --- Deprecated field migration hints ---
